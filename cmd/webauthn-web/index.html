@@ -1,0 +1,250 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Vault — WebAuthn</title>
+  <style>
+    * { box-sizing: border-box; }
+    body { font-family: system-ui, sans-serif; max-width: 360px; margin: 2rem auto; padding: 0 1rem; }
+    h1 { font-size: 1.25rem; margin-bottom: 1.5rem; }
+    label { display: block; margin-bottom: 0.25rem; font-weight: 500; }
+    input[type="text"] { width: 100%; padding: 0.5rem; margin-bottom: 1rem; border: 1px solid #ccc; border-radius: 4px; }
+    .row { margin-bottom: 1rem; }
+    button { padding: 0.5rem 1rem; margin-right: 0.5rem; margin-bottom: 0.5rem; cursor: pointer; border-radius: 4px; border: 1px solid #333; background: #fff; }
+    button.primary { background: #333; color: #fff; border-color: #333; }
+    button:disabled { opacity: 0.6; cursor: not-allowed; }
+    .hint { font-size: 0.875rem; color: #666; margin-top: 0.25rem; }
+    #message { margin-top: 1rem; padding: 0.5rem; border-radius: 4px; min-height: 1.5rem; }
+    #message.success { background: #e8f5e9; color: #2e7d32; }
+    #message.error { background: #ffebee; color: #c62828; }
+    #tokenBlock { margin-top: 1rem; padding: 0.75rem; background: #f5f5f5; border-radius: 4px; }
+    #tokenBlock .copy-row { display: flex; align-items: center; gap: 0.5rem; margin-top: 0.5rem; }
+    .vault-link { display: inline-block; margin-top: 1.5rem; color: #1565c0; }
+  </style>
+</head>
+<body>
+  <h1>Vault — вход через WebAuthn</h1>
+
+  <div class="row">
+    <label for="username">Имя пользователя</label>
+    <input type="text" id="username" placeholder="alice" autocomplete="username">
+    <span class="hint">Для discoverable-входа оставьте пустым</span>
+  </div>
+
+  <div class="row">
+    <button type="button" id="btnRegister" class="primary">Регистрация</button>
+    <button type="button" id="btnLogin">Вход</button>
+  </div>
+
+  <div id="message" role="status"></div>
+  <div id="tokenBlock" style="display: none;">
+    <span id="tokenLabel">Токен получен.</span>
+    <div class="copy-row">
+      <button type="button" id="btnCopyToken">Скопировать</button>
+      <span id="copyFeedback"></span>
+    </div>
+  </div>
+  <a href="http://localhost:8200" class="vault-link" target="_blank" rel="noopener">Войти в Vault</a>
+
+  <script>
+    (function () {
+      const base = '/vault/v1/auth/webauthn';
+      const usernameEl = document.getElementById('username');
+      const btnRegister = document.getElementById('btnRegister');
+      const btnLogin = document.getElementById('btnLogin');
+      const messageEl = document.getElementById('message');
+      const tokenBlock = document.getElementById('tokenBlock');
+      const btnCopyToken = document.getElementById('btnCopyToken');
+      const copyFeedback = document.getElementById('copyFeedback');
+      let lastToken = '';
+
+      if (!window.PublicKeyCredential) {
+        showMessage('WebAuthn не поддерживается в этом браузере.', true);
+        btnRegister.disabled = true;
+        btnLogin.disabled = true;
+        return;
+      }
+
+      function showMessage(text, isError) {
+        messageEl.textContent = text || '';
+        messageEl.className = isError ? 'error' : 'success';
+      }
+
+      function bufferDecode(value) {
+        const binary = atob(value.replace(/-/g, '+').replace(/_/g, '/'));
+        return Uint8Array.from(binary, c => c.charCodeAt(0));
+      }
+
+      function bufferEncode(buffer) {
+        const bytes = new Uint8Array(buffer);
+        let binary = '';
+        for (let i = 0; i < bytes.length; i++) binary += String.fromCharCode(bytes[i]);
+        return btoa(binary).replace(/\+/g, '-').replace(/\//g, '_').replace(/=/g, '');
+      }
+
+      function parseCreationOptions(data) {
+        const pubKey = data.publicKey || data;
+        const options = { ...pubKey };
+        if (options.challenge) options.challenge = bufferDecode(options.challenge);
+        if (options.user && options.user.id) options.user = { ...options.user, id: bufferDecode(options.user.id) };
+        if (options.excludeCredentials && options.excludeCredentials.length) {
+          options.excludeCredentials = options.excludeCredentials.map(function (c) {
+            return { ...c, id: bufferDecode(c.id) };
+          });
+        }
+        return options;
+      }
+
+      function parseRequestOptions(data) {
+        const pubKey = data.publicKey || data;
+        const options = { ...pubKey };
+        if (options.challenge) options.challenge = bufferDecode(options.challenge);
+        if (options.allowCredentials && options.allowCredentials.length) {
+          options.allowCredentials = options.allowCredentials.map(function (c) {
+            return { ...c, id: bufferDecode(c.id) };
+          });
+        }
+        return options;
+      }
+
+      function credentialToCreationPayload(credential) {
+        return {
+          id: credential.id,
+          rawId: bufferEncode(credential.rawId),
+          type: credential.type,
+          response: {
+            clientDataJSON: bufferEncode(credential.response.clientDataJSON),
+            attestationObject: bufferEncode(credential.response.attestationObject),
+          },
+        };
+      }
+
+      function credentialToAssertionPayload(credential) {
+        const r = credential.response;
+        return {
+          id: credential.id,
+          rawId: bufferEncode(credential.rawId),
+          type: credential.type,
+          response: {
+            clientDataJSON: bufferEncode(r.clientDataJSON),
+            authenticatorData: bufferEncode(r.authenticatorData),
+            signature: bufferEncode(r.signature),
+            userHandle: r.userHandle ? bufferEncode(r.userHandle) : undefined,
+          },
+        };
+      }
+
+      btnRegister.addEventListener('click', async function () {
+        const username = usernameEl.value.trim();
+        if (!username) {
+          showMessage('Введите имя пользователя для регистрации.', true);
+          return;
+        }
+        btnRegister.disabled = true;
+        showMessage('Регистрация…');
+        try {
+          const res = await fetch(base + '/register/begin', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ username: username }),
+          });
+          const wrap = await res.json();
+          if (wrap.errors) {
+            showMessage(wrap.errors.join(' ') || 'Ошибка register/begin', true);
+            return;
+          }
+          const data = wrap.data || wrap;
+          const options = parseCreationOptions(data);
+          const credential = await navigator.credentials.create({ publicKey: options });
+          if (!credential) {
+            showMessage('Создание учётных данных отменено.', true);
+            return;
+          }
+          const finishRes = await fetch(base + '/register/finish', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ username: username, credential: credentialToCreationPayload(credential) }),
+          });
+          const finishWrap = await finishRes.json();
+          if (finishWrap.errors) {
+            showMessage(finishWrap.errors.join(' ') || 'Ошибка register/finish', true);
+            return;
+          }
+          showMessage('Регистрация прошла успешно: ' + username);
+        } catch (e) {
+          showMessage('Ошибка: ' + (e.message || e), true);
+        } finally {
+          btnRegister.disabled = false;
+        }
+      });
+
+      btnLogin.addEventListener('click', async function () {
+        const username = usernameEl.value.trim();
+        btnLogin.disabled = true;
+        showMessage('Вход…');
+        try {
+          const body = username ? { username: username } : {};
+          const res = await fetch(base + '/login/begin', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(body),
+          });
+          const wrap = await res.json();
+          if (wrap.errors) {
+            showMessage(wrap.errors.join(' ') || 'Ошибка login/begin', true);
+            return;
+          }
+          const data = wrap.data || wrap;
+          const options = parseRequestOptions(data);
+          const credential = await navigator.credentials.get({ publicKey: options });
+          if (!credential) {
+            showMessage('Вход отменён.', true);
+            return;
+          }
+          const finishBody = { credential: credentialToAssertionPayload(credential) };
+          if (username) finishBody.username = username;
+          const finishRes = await fetch(base + '/login/finish', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(finishBody),
+          });
+          const finishWrap = await finishRes.json();
+          if (finishWrap.errors) {
+            showMessage(finishWrap.errors.join(' ') || 'Ошибка login/finish', true);
+            return;
+          }
+          const auth = finishWrap.auth || finishWrap;
+          const token = auth.client_token;
+          const displayName = auth.display_name || username || 'user';
+          showMessage('Вход выполнен: ' + displayName);
+          if (token) {
+            lastToken = token;
+            tokenBlock.style.display = 'block';
+            copyFeedback.textContent = '';
+          } else {
+            tokenBlock.style.display = 'none';
+          }
+        } catch (e) {
+          showMessage('Ошибка: ' + (e.message || e), true);
+        } finally {
+          btnLogin.disabled = false;
+        }
+      });
+
+      btnCopyToken.addEventListener('click', async function () {
+        if (!lastToken) return;
+        try {
+          await navigator.clipboard.writeText(lastToken);
+          copyFeedback.textContent = 'Скопировано';
+          copyFeedback.style.color = '#2e7d32';
+          setTimeout(function () { copyFeedback.textContent = ''; }, 2000);
+        } catch (e) {
+          copyFeedback.textContent = 'Ошибка';
+          copyFeedback.style.color = '#c62828';
+        }
+      });
+    })();
+  </script>
+</body>
+</html>
