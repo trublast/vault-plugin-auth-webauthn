@@ -2,7 +2,6 @@ package webauthnbackend
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"strings"
 	"sync"
@@ -11,7 +10,6 @@ import (
 	"github.com/go-webauthn/webauthn/protocol"
 	"github.com/go-webauthn/webauthn/webauthn"
 	"github.com/hashicorp/vault/sdk/framework"
-	"github.com/hashicorp/vault/sdk/helper/policyutil"
 	"github.com/hashicorp/vault/sdk/logical"
 )
 
@@ -149,47 +147,6 @@ func (b *backend) getWebAuthn(ctx context.Context, s logical.Storage) (*webauthn
 	b.webAuthn = w
 	b.mu.Unlock()
 	return w, nil
-}
-
-func (b *backend) pathAuthRenew(ctx context.Context, req *logical.Request, _ *framework.FieldData) (*logical.Response, error) {
-	if req.Auth == nil {
-		return nil, logical.ErrInvalidRequest
-	}
-	usernameRaw, ok := req.Auth.InternalData["username"]
-	if !ok {
-		return nil, logical.ErrInvalidRequest
-	}
-	username, ok := usernameRaw.(string)
-	if !ok || username == "" {
-		return nil, logical.ErrInvalidRequest
-	}
-
-	user, err := b.getStoredUser(ctx, req.Storage, username)
-	if err != nil {
-		return nil, err
-	}
-	if user == nil {
-		return nil, nil
-	}
-
-	if !policyutil.EquivalentPolicies(user.TokenPolicies, req.Auth.Policies) {
-		return nil, errors.New("policies have changed, not renewing")
-	}
-
-	ttl := user.TokenTTL
-	if ttl == 0 {
-		ttl = 30 * time.Second
-	}
-	maxTTL := user.TokenMaxTTL
-	if maxTTL == 0 {
-		maxTTL = 60 * time.Minute
-	}
-
-	resp := &logical.Response{Auth: req.Auth}
-	resp.Auth.TTL = ttl
-	resp.Auth.MaxTTL = maxTTL
-	resp.Auth.Period = user.TokenPeriod
-	return resp, nil
 }
 
 const backendHelp = `

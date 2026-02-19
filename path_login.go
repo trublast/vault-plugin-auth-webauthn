@@ -4,14 +4,15 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
-	"time"
 
 	"github.com/go-webauthn/webauthn/protocol"
 	"github.com/go-webauthn/webauthn/webauthn"
 	"github.com/hashicorp/vault/sdk/framework"
 	"github.com/hashicorp/vault/sdk/helper/cidrutil"
+	"github.com/hashicorp/vault/sdk/helper/policyutil"
 	"github.com/hashicorp/vault/sdk/logical"
 )
 
@@ -28,6 +29,9 @@ func pathLoginBegin(b *backend) *framework.Path {
 			logical.UpdateOperation: &framework.PathOperation{
 				Callback: b.pathLoginBegin,
 				Summary:  "Start WebAuthn login",
+			},
+			logical.AliasLookaheadOperation: &framework.PathOperation{
+				Callback: b.pathLoginAliasLookahead,
 			},
 		},
 		HelpSynopsis:    "Begin WebAuthn login",
@@ -57,6 +61,20 @@ func pathLoginFinish(b *backend) *framework.Path {
 		HelpSynopsis:    "Complete WebAuthn login",
 		HelpDescription: "Submit the assertion response to complete login and receive a Vault auth token.",
 	}
+}
+
+func (b *backend) pathLoginAliasLookahead(ctx context.Context, req *logical.Request, d *framework.FieldData) (*logical.Response, error) {
+	username := strings.TrimSpace(d.Get("username").(string))
+	if username == "" {
+		return nil, errors.New("missing username")
+	}
+	return &logical.Response{
+		Auth: &logical.Auth{
+			Alias: &logical.Alias{
+				Name: username,
+			},
+		},
+	}, nil
 }
 
 func (b *backend) pathLoginBegin(ctx context.Context, req *logical.Request, d *framework.FieldData) (*logical.Response, error) {
@@ -262,15 +280,40 @@ func (b *backend) loginSuccessResponse(ctx context.Context, req *logical.Request
 		}
 	}
 
-	// Apply defaults when user has no token params set
-	if auth.TTL == 0 {
-		auth.TTL = 30 * time.Second
-	}
-	if auth.MaxTTL == 0 {
-		auth.MaxTTL = 60 * time.Minute
-	}
 	if len(auth.Policies) == 0 && !auth.NoDefaultPolicy {
 		auth.Policies = []string{"default"}
 	}
 	return &logical.Response{Auth: auth}, nil
+}
+
+func (b *backend) pathAuthRenew(ctx context.Context, req *logical.Request, _ *framework.FieldData) (*logical.Response, error) {
+	if req.Auth == nil {
+		return nil, logical.ErrInvalidRequest
+	}
+	usernameRaw, ok := req.Auth.InternalData["username"]
+	if !ok {
+		return nil, logical.ErrInvalidRequest
+	}
+	username, ok := usernameRaw.(string)
+	if !ok || username == "" {
+		return nil, logical.ErrInvalidRequest
+	}
+
+	user, err := b.getStoredUser(ctx, req.Storage, username)
+	if err != nil {
+		return nil, err
+	}
+	if user == nil {
+		return nil, nil
+	}
+
+	if !policyutil.EquivalentPolicies(user.TokenPolicies, req.Auth.Policies) {
+		return nil, errors.New("policies have changed, not renewing")
+	}
+
+	resp := &logical.Response{Auth: req.Auth}
+	resp.Auth.TTL = user.TokenTTL
+	resp.Auth.MaxTTL = user.TokenMaxTTL
+	resp.Auth.Period = user.TokenPeriod
+	return resp, nil
 }
