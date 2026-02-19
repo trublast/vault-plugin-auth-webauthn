@@ -2,6 +2,7 @@ package webauthnbackend
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"sync"
@@ -10,6 +11,7 @@ import (
 	"github.com/go-webauthn/webauthn/protocol"
 	"github.com/go-webauthn/webauthn/webauthn"
 	"github.com/hashicorp/vault/sdk/framework"
+	"github.com/hashicorp/vault/sdk/helper/policyutil"
 	"github.com/hashicorp/vault/sdk/logical"
 )
 
@@ -56,6 +58,8 @@ func newBackend() *backend {
 				pathConfig(b),
 				pathUserList(b),
 				pathUser(b),
+				pathUserPolicies(b),
+				pathUserCredential(b),
 				pathRegisterBegin(b),
 				pathRegisterFinish(b),
 				pathLoginBegin(b),
@@ -151,8 +155,41 @@ func (b *backend) pathAuthRenew(ctx context.Context, req *logical.Request, _ *fr
 	if req.Auth == nil {
 		return nil, logical.ErrInvalidRequest
 	}
-	// Optionally enforce TTL; for now just extend like the example.
-	return framework.LeaseExtend(30*time.Second, 60*time.Minute, b.System())(ctx, req, nil)
+	usernameRaw, ok := req.Auth.InternalData["username"]
+	if !ok {
+		return nil, logical.ErrInvalidRequest
+	}
+	username, ok := usernameRaw.(string)
+	if !ok || username == "" {
+		return nil, logical.ErrInvalidRequest
+	}
+
+	user, err := b.getStoredUser(ctx, req.Storage, username)
+	if err != nil {
+		return nil, err
+	}
+	if user == nil {
+		return nil, nil
+	}
+
+	if !policyutil.EquivalentPolicies(user.TokenPolicies, req.Auth.Policies) {
+		return nil, errors.New("policies have changed, not renewing")
+	}
+
+	ttl := user.TokenTTL
+	if ttl == 0 {
+		ttl = 30 * time.Second
+	}
+	maxTTL := user.TokenMaxTTL
+	if maxTTL == 0 {
+		maxTTL = 60 * time.Minute
+	}
+
+	resp := &logical.Response{Auth: req.Auth}
+	resp.Auth.TTL = ttl
+	resp.Auth.MaxTTL = maxTTL
+	resp.Auth.Period = user.TokenPeriod
+	return resp, nil
 }
 
 const backendHelp = `

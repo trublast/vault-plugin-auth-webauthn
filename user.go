@@ -1,20 +1,24 @@
 package webauthnbackend
 
 import (
+	"bytes"
 	"crypto/rand"
 
 	"github.com/go-webauthn/webauthn/protocol"
 	"github.com/go-webauthn/webauthn/webauthn"
+	"github.com/hashicorp/vault/sdk/helper/tokenutil"
 )
 
 const userPrefix = "user/"
 
 // StoredUser implements webauthn.User and is persisted in Vault storage.
 type StoredUser struct {
-	ID            []byte              `json:"id"`
-	Name          string              `json:"name"`
-	DisplayName   string              `json:"display_name"`
-	Credentials   []webauthn.Credential `json:"credentials"`
+	tokenutil.TokenParams
+
+	ID          []byte                `json:"id"`
+	Name        string                `json:"name"`
+	DisplayName string                `json:"display_name"`
+	Credentials []webauthn.Credential `json:"credentials"`
 }
 
 // NewStoredUser creates a new user with a random ID.
@@ -65,6 +69,17 @@ func (u *StoredUser) WebAuthnCredentials() []webauthn.Credential {
 // AddCredential adds a credential to the user.
 func (u *StoredUser) AddCredential(cred webauthn.Credential) {
 	u.Credentials = append(u.Credentials, cred)
+}
+
+// RemoveCredentialByID removes a credential by its ID. Returns true if removed.
+func (u *StoredUser) RemoveCredentialByID(id []byte) bool {
+	for i, c := range u.Credentials {
+		if bytes.Equal(c.ID, id) {
+			u.Credentials = append(u.Credentials[:i], u.Credentials[i+1:]...)
+			return true
+		}
+	}
+	return false
 }
 
 // CredentialExcludeList returns descriptors for credentials to exclude from registration.

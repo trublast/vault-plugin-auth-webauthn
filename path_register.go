@@ -70,11 +70,25 @@ func (b *backend) pathRegisterBegin(ctx context.Context, req *logical.Request, d
 		return logical.ErrorResponse("username is required"), nil
 	}
 
+	cfg, err := b.config(ctx, req.Storage)
+	if err != nil {
+		return nil, err
+	}
+
 	user, err := b.getStoredUser(ctx, req.Storage, username)
 	if err != nil {
 		return nil, err
 	}
+
+	// Reject if user already has credentials (username is taken).
+	if user != nil && len(user.Credentials) > 0 {
+		return logical.ErrorResponse("user already registered with credentials"), nil
+	}
+
 	if user == nil {
+		if !cfg.autoRegistrationEnabled() {
+			return logical.ErrorResponse("auto_registration is disabled: user must be pre-created by admin via user/ path"), nil
+		}
 		user, err = NewStoredUser(username, username)
 		if err != nil {
 			return nil, err
@@ -139,6 +153,9 @@ func (b *backend) pathRegisterFinish(ctx context.Context, req *logical.Request, 
 	}
 	if user == nil {
 		return logical.ErrorResponse("user not found or registration not started"), nil
+	}
+	if len(user.Credentials) > 0 {
+		return logical.ErrorResponse("user already has credentials"), nil
 	}
 
 	// Get session by challenge from the credential response.

@@ -11,6 +11,7 @@ import (
 	"github.com/go-webauthn/webauthn/protocol"
 	"github.com/go-webauthn/webauthn/webauthn"
 	"github.com/hashicorp/vault/sdk/framework"
+	"github.com/hashicorp/vault/sdk/helper/cidrutil"
 	"github.com/hashicorp/vault/sdk/logical"
 )
 
@@ -193,7 +194,7 @@ func (b *backend) pathLoginFinish(ctx context.Context, req *logical.Request, d *
 		if err := b.saveStoredUser(ctx, req.Storage, user); err != nil {
 			b.Logger().Warn("failed to update credential sign count", "error", err)
 		}
-		return b.loginSuccessResponse(username, credential)
+		return b.loginSuccessResponse(ctx, req, user, credential)
 	}
 
 	// Username-based flow
@@ -228,33 +229,48 @@ func (b *backend) pathLoginFinish(ctx context.Context, req *logical.Request, d *
 		b.Logger().Warn("failed to update credential sign count", "error", err)
 	}
 
-	return b.loginSuccessResponse(username, credential)
+	return b.loginSuccessResponse(ctx, req, user, credential)
 }
 
-func (b *backend) loginSuccessResponse(username string, credential *webauthn.Credential) (*logical.Response, error) {
-	return &logical.Response{
-		Auth: &logical.Auth{
-			DisplayName: username,
-			Alias: &logical.Alias{
-				Name: username,
-				Metadata: map[string]string{
-					"username": username,
-				},
-			},
+func (b *backend) loginSuccessResponse(ctx context.Context, req *logical.Request, user *StoredUser, credential *webauthn.Credential) (*logical.Response, error) {
+	auth := &logical.Auth{
+		DisplayName: user.Name,
+		Alias: &logical.Alias{
+			Name: user.Name,
 			Metadata: map[string]string{
-				"username":                 username,
-				"attestation_type":         credential.AttestationType,
-				"authenticator_sign_count": fmt.Sprintf("%d", credential.Authenticator.SignCount),
+				"username": user.Name,
 			},
-			InternalData: map[string]interface{}{
-				"username": username,
-			},
-			LeaseOptions: logical.LeaseOptions{
-				TTL:       30 * time.Second,
-				MaxTTL:    60 * time.Minute,
-				Renewable: true,
-			},
-			Policies: []string{"default"},
 		},
-	}, nil
+		Metadata: map[string]string{
+			"username":                 user.Name,
+			"attestation_type":         credential.AttestationType,
+			"authenticator_sign_count": fmt.Sprintf("%d", credential.Authenticator.SignCount),
+		},
+		InternalData: map[string]interface{}{
+			"username": user.Name,
+		},
+	}
+	user.PopulateTokenAuth(auth)
+
+	if len(user.TokenBoundCIDRs) > 0 {
+		if req.Connection == nil {
+			b.Logger().Warn("token bound CIDRs found but no connection information available for validation")
+			return nil, logical.ErrPermissionDenied
+		}
+		if !cidrutil.RemoteAddrIsOk(req.Connection.RemoteAddr, user.TokenBoundCIDRs) {
+			return nil, logical.ErrPermissionDenied
+		}
+	}
+
+	// Apply defaults when user has no token params set
+	if auth.TTL == 0 {
+		auth.TTL = 30 * time.Second
+	}
+	if auth.MaxTTL == 0 {
+		auth.MaxTTL = 60 * time.Minute
+	}
+	if len(auth.Policies) == 0 && !auth.NoDefaultPolicy {
+		auth.Policies = []string{"default"}
+	}
+	return &logical.Response{Auth: auth}, nil
 }
