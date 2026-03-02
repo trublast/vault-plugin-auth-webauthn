@@ -65,9 +65,16 @@ func (b *backend) pathRegisterBegin(ctx context.Context, req *logical.Request, d
 		return logical.ErrorResponse("WebAuthn not configured: set rp_id and rp_origins via config first"), nil
 	}
 
-	username := strings.TrimSpace(d.Get("username").(string))
+	usernameRaw, ok := d.GetOk("username")
+	if !ok || usernameRaw == nil {
+		return logical.ErrorResponse("username is required"), nil
+	}
+	username := strings.TrimSpace(usernameRaw.(string))
 	if username == "" {
 		return logical.ErrorResponse("username is required"), nil
+	}
+	if err := validateUsername(username); err != nil {
+		return logical.ErrorResponse("invalid username: %v", err), nil
 	}
 
 	cfg, err := b.config(ctx, req.Storage)
@@ -82,12 +89,12 @@ func (b *backend) pathRegisterBegin(ctx context.Context, req *logical.Request, d
 
 	// Reject if user already has credentials (username is taken).
 	if user != nil && len(user.Credentials) > 0 {
-		return logical.ErrorResponse("user already registered with credentials"), nil
+		return logical.ErrorResponse(msgRegistrationFailed), nil
 	}
 
 	if user == nil {
 		if !cfg.autoRegistrationEnabled() {
-			return logical.ErrorResponse("auto_registration is disabled: user must be pre-created by admin via user/ path"), nil
+			return logical.ErrorResponse(msgRegistrationFailed), nil
 		}
 		user, err = NewStoredUser(username, username)
 		if err != nil {
@@ -137,9 +144,16 @@ func (b *backend) pathRegisterFinish(ctx context.Context, req *logical.Request, 
 		return logical.ErrorResponse("WebAuthn not configured"), nil
 	}
 
-	username := strings.TrimSpace(d.Get("username").(string))
+	usernameRaw, ok := d.GetOk("username")
+	if !ok || usernameRaw == nil {
+		return logical.ErrorResponse("username is required"), nil
+	}
+	username := strings.TrimSpace(usernameRaw.(string))
 	if username == "" {
 		return logical.ErrorResponse("username is required"), nil
+	}
+	if err := validateUsername(username); err != nil {
+		return logical.ErrorResponse("invalid username: %v", err), nil
 	}
 	credMap, ok := d.GetOk("credential")
 	if !ok {
@@ -151,11 +165,8 @@ func (b *backend) pathRegisterFinish(ctx context.Context, req *logical.Request, 
 	if err != nil {
 		return nil, err
 	}
-	if user == nil {
-		return logical.ErrorResponse("user not found or registration not started"), nil
-	}
-	if len(user.Credentials) > 0 {
-		return logical.ErrorResponse("user already has credentials"), nil
+	if user == nil || len(user.Credentials) > 0 {
+		return logical.ErrorResponse(msgRegistrationFailed), nil
 	}
 
 	// Get session by challenge from the credential response.
@@ -175,17 +186,14 @@ func (b *backend) pathRegisterFinish(ctx context.Context, req *logical.Request, 
 	if err != nil {
 		return nil, err
 	}
-	if session == nil {
-		return logical.ErrorResponse("registration session expired or not found"), nil
-	}
-	if regUsername != username {
-		return logical.ErrorResponse("username does not match registration session"), nil
+	if session == nil || regUsername != username {
+		return logical.ErrorResponse(msgRegistrationFailed), nil
 	}
 	defer func() { _ = b.deleteRegistrationSession(ctx, req.Storage, challenge) }()
 
 	credential, err := w.CreateCredential(user, *session, parsed)
 	if err != nil {
-		return logical.ErrorResponse("failed to create credential: %v", err), nil
+		return logical.ErrorResponse(msgRegistrationFailed), nil
 	}
 
 	user.AddCredential(*credential)

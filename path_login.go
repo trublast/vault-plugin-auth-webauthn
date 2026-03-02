@@ -64,9 +64,16 @@ func pathLoginFinish(b *backend) *framework.Path {
 }
 
 func (b *backend) pathLoginAliasLookahead(ctx context.Context, req *logical.Request, d *framework.FieldData) (*logical.Response, error) {
-	username := strings.TrimSpace(d.Get("username").(string))
+	usernameRaw, ok := d.GetOk("username")
+	if !ok {
+		return nil, errors.New("missing username")
+	}
+	username := strings.TrimSpace(usernameRaw.(string))
 	if username == "" {
 		return nil, errors.New("missing username")
+	}
+	if err := validateUsername(username); err != nil {
+		return nil, err
 	}
 	return &logical.Response{
 		Auth: &logical.Auth{
@@ -86,7 +93,10 @@ func (b *backend) pathLoginBegin(ctx context.Context, req *logical.Request, d *f
 		return logical.ErrorResponse("WebAuthn not configured: set rp_id and rp_origins via config first"), nil
 	}
 
-	username := strings.TrimSpace(d.Get("username").(string))
+	var username string
+	if v, ok := d.GetOk("username"); ok && v != nil {
+		username = strings.TrimSpace(v.(string))
+	}
 
 	if username == "" {
 		// Discoverable (passkey) flow: no allowCredentials, browser shows passkey picker
@@ -109,15 +119,15 @@ func (b *backend) pathLoginBegin(ctx context.Context, req *logical.Request, d *f
 	}
 
 	// Username-based flow
+	if err := validateUsername(username); err != nil {
+		return logical.ErrorResponse("invalid username: %v", err), nil
+	}
 	user, err := b.getStoredUser(ctx, req.Storage, username)
 	if err != nil {
 		return nil, err
 	}
-	if user == nil {
-		return logical.ErrorResponse("user is not registered"), nil
-	}
-	if len(user.WebAuthnCredentials()) == 0 {
-		return logical.ErrorResponse("user has no credentials"), nil
+	if user == nil || len(user.WebAuthnCredentials()) == 0 {
+		return logical.ErrorResponse(msgLoginFailed), nil
 	}
 
 	assertion, session, err := w.BeginLogin(user)
@@ -150,7 +160,10 @@ func (b *backend) pathLoginFinish(ctx context.Context, req *logical.Request, d *
 		return logical.ErrorResponse("WebAuthn not configured"), nil
 	}
 
-	username := strings.TrimSpace(d.Get("username").(string))
+	var username string
+	if v, ok := d.GetOk("username"); ok && v != nil {
+		username = strings.TrimSpace(v.(string))
+	}
 	credMap, ok := d.GetOk("credential")
 	if !ok {
 		return logical.ErrorResponse("credential is required"), nil
@@ -172,7 +185,7 @@ func (b *backend) pathLoginFinish(ctx context.Context, req *logical.Request, d *
 		return nil, err
 	}
 	if session == nil {
-		return logical.ErrorResponse("login session expired or not found"), nil
+		return logical.ErrorResponse(msgLoginFailed), nil
 	}
 	defer func() { _ = b.deleteLoginSession(ctx, req.Storage, challenge) }()
 
@@ -198,7 +211,7 @@ func (b *backend) pathLoginFinish(ctx context.Context, req *logical.Request, d *
 		}
 		discoveredUser, credential, err := w.ValidatePasskeyLogin(handler, *session, parsed)
 		if err != nil {
-			return logical.ErrorResponse("discoverable login validation failed: %v", err), nil
+			return logical.ErrorResponse(msgLoginFailed), nil
 		}
 		user = discoveredUser.(*StoredUser)
 		username = user.Name
@@ -220,7 +233,10 @@ func (b *backend) pathLoginFinish(ctx context.Context, req *logical.Request, d *
 		username = loginUsername
 	}
 	if loginUsername != username {
-		return logical.ErrorResponse("username does not match login session"), nil
+		return logical.ErrorResponse(msgLoginFailed), nil
+	}
+	if err := validateUsername(username); err != nil {
+		return logical.ErrorResponse("invalid username: %v", err), nil
 	}
 
 	user, err = b.getStoredUser(ctx, req.Storage, username)
@@ -228,12 +244,12 @@ func (b *backend) pathLoginFinish(ctx context.Context, req *logical.Request, d *
 		return nil, err
 	}
 	if user == nil {
-		return logical.ErrorResponse("user not found"), nil
+		return logical.ErrorResponse(msgLoginFailed), nil
 	}
 
 	credential, err := w.ValidateLogin(user, *session, parsed)
 	if err != nil {
-		return logical.ErrorResponse("login validation failed: %v", err), nil
+		return logical.ErrorResponse(msgLoginFailed), nil
 	}
 
 	// Update stored credential sign count
@@ -296,6 +312,9 @@ func (b *backend) pathAuthRenew(ctx context.Context, req *logical.Request, _ *fr
 	}
 	username, ok := usernameRaw.(string)
 	if !ok || username == "" {
+		return nil, logical.ErrInvalidRequest
+	}
+	if err := validateUsername(username); err != nil {
 		return nil, logical.ErrInvalidRequest
 	}
 

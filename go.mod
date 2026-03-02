@@ -3,7 +3,7 @@ module github.com/trublast/vault-plugin-auth-webauthn
 go 1.25.0
 
 require (
-	github.com/go-webauthn/webauthn v0.15.0
+	github.com/go-webauthn/webauthn v0.16.0
 	github.com/hashicorp/vault/api v1.14.0
 	github.com/hashicorp/vault/sdk v0.12.0
 )
