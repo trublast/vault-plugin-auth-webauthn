@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"strings"
+	"time"
 
 	"github.com/go-webauthn/webauthn/protocol"
 	"github.com/go-webauthn/webauthn/webauthn"
@@ -19,6 +20,10 @@ func pathRegisterBegin(b *backend) *framework.Path {
 			"username": {
 				Type:        framework.TypeString,
 				Description: "Username to register for WebAuthn",
+			},
+			"registration_code": {
+				Type:        framework.TypeString,
+				Description: "One-time registration code returned when the user was created",
 			},
 		},
 		Operations: map[logical.Operation]framework.OperationHandler{
@@ -36,10 +41,6 @@ func pathRegisterFinish(b *backend) *framework.Path {
 	return &framework.Path{
 		Pattern: "register/finish$",
 		Fields: map[string]*framework.FieldSchema{
-			"username": {
-				Type:        framework.TypeString,
-				Description: "Username being registered",
-			},
 			"credential": {
 				Type:        framework.TypeMap,
 				Description: "Credential creation response from the authenticator (PublicKeyCredential with response)",
@@ -76,22 +77,31 @@ func (b *backend) pathRegisterBegin(ctx context.Context, req *logical.Request, d
 	if err := validateUsername(username); err != nil {
 		return logical.ErrorResponse("invalid username: %v", err), nil
 	}
+	var registrationCode string
+	if v, ok := d.GetOk("registration_code"); ok && v != nil {
+		registrationCode = strings.TrimSpace(v.(string))
+	}
 
 	cfg, err := b.config(ctx, req.Storage)
 	if err != nil {
 		return nil, err
 	}
 
+	lock := b.userLock(username)
+	lock.Lock()
+	defer lock.Unlock()
+
 	user, err := b.getStoredUser(ctx, req.Storage, username)
 	if err != nil {
 		return nil, err
 	}
 
-	// Reject if user already has credentials (username is taken).
-	if user != nil && len(user.Credentials) > 0 {
-		return logical.ErrorResponse(msgRegistrationFailed), nil
-	}
-
+	// pendingUser is set only for the auto-registration flow. It carries an
+	// ephemeral, unpersisted user through the session so that nothing is written
+	// to the user store until register/finish succeeds. This prevents an
+	// unauthenticated begin call from creating permanent (and credential-less)
+	// user records or user_id index entries.
+	var pendingUser *StoredUser
 	if user == nil {
 		if !cfg.autoRegistrationEnabled() {
 			return logical.ErrorResponse(msgRegistrationFailed), nil
@@ -100,12 +110,9 @@ func (b *backend) pathRegisterBegin(ctx context.Context, req *logical.Request, d
 		if err != nil {
 			return nil, err
 		}
-		if err := b.saveStoredUser(ctx, req.Storage, user); err != nil {
-			return nil, err
-		}
-		if err := b.saveUserIDIndex(ctx, req.Storage, user.ID, username); err != nil {
-			return nil, err
-		}
+		pendingUser = user
+	} else if !user.RegistrationCodeMatches(registrationCode, time.Now()) {
+		return logical.ErrorResponse(msgRegistrationFailed), nil
 	}
 
 	opts := []webauthn.RegistrationOption{
@@ -113,13 +120,15 @@ func (b *backend) pathRegisterBegin(ctx context.Context, req *logical.Request, d
 		webauthn.WithAuthenticatorSelection(protocol.AuthenticatorSelection{
 			UserVerification: protocol.VerificationPreferred,
 		}),
+		webauthn.WithResidentKeyRequirement(protocol.ResidentKeyRequirementRequired),
+		webauthn.WithExtensions(protocol.AuthenticationExtensions{"credProps": true}),
 	}
 	creation, session, err := w.BeginRegistration(user, opts...)
 	if err != nil {
 		return logical.ErrorResponse("failed to begin registration: %v", err), nil
 	}
 
-	if err := b.saveRegistrationSession(ctx, req.Storage, session.Challenge, username, session); err != nil {
+	if err := b.saveRegistrationSession(ctx, req.Storage, session.Challenge, username, session, pendingUser); err != nil {
 		return nil, err
 	}
 
@@ -144,30 +153,11 @@ func (b *backend) pathRegisterFinish(ctx context.Context, req *logical.Request, 
 		return logical.ErrorResponse("WebAuthn not configured"), nil
 	}
 
-	usernameRaw, ok := d.GetOk("username")
-	if !ok || usernameRaw == nil {
-		return logical.ErrorResponse("username is required"), nil
-	}
-	username := strings.TrimSpace(usernameRaw.(string))
-	if username == "" {
-		return logical.ErrorResponse("username is required"), nil
-	}
-	if err := validateUsername(username); err != nil {
-		return logical.ErrorResponse("invalid username: %v", err), nil
-	}
 	credMap, ok := d.GetOk("credential")
 	if !ok {
 		return logical.ErrorResponse("credential is required"), nil
 	}
 	credentialMap := credMap.(map[string]interface{})
-
-	user, err := b.getStoredUser(ctx, req.Storage, username)
-	if err != nil {
-		return nil, err
-	}
-	if user == nil || len(user.Credentials) > 0 {
-		return logical.ErrorResponse(msgRegistrationFailed), nil
-	}
 
 	// Get session by challenge from the credential response.
 	// Client sends the same payload as in the browser; response has clientDataJSON which contains challenge.
@@ -182,14 +172,54 @@ func (b *backend) pathRegisterFinish(ctx context.Context, req *logical.Request, 
 
 	// Challenge is in the session we stored at begin. We need to find session by challenge from parsed response.
 	challenge := parsed.Response.CollectedClientData.Challenge
-	regUsername, session, err := b.getRegistrationSession(ctx, req.Storage, challenge)
+
+	// Peek the session (keyed by the random challenge) to learn which user we
+	// must lock. The challenge->username mapping is immutable, so this read is
+	// only used to pick the per-user lock; the authoritative read happens under
+	// the lock below.
+	username, _, _, err := b.getRegistrationSession(ctx, req.Storage, challenge)
 	if err != nil {
 		return nil, err
 	}
-	if session == nil || regUsername != username {
+	if username == "" {
+		return logical.ErrorResponse(msgRegistrationFailed), nil
+	}
+
+	lock := b.userLock(username)
+	lock.Lock()
+	defer lock.Unlock()
+
+	// Authoritative read under the user lock. Deleting the session under the
+	// same lock guarantees a concurrent finish for the same challenge observes
+	// it as already consumed (single-use), so a credential cannot be added twice.
+	username, session, pendingUser, err := b.getRegistrationSession(ctx, req.Storage, challenge)
+	if err != nil {
+		return nil, err
+	}
+	if session == nil || username == "" {
 		return logical.ErrorResponse(msgRegistrationFailed), nil
 	}
 	defer func() { _ = b.deleteRegistrationSession(ctx, req.Storage, challenge) }()
+
+	user, err := b.getStoredUser(ctx, req.Storage, username)
+	if err != nil {
+		return nil, err
+	}
+
+	// isNewUser is true for the auto-registration flow: the user was not
+	// persisted at begin and is materialized here from the pending data carried
+	// in the session. We are holding the per-user lock and just confirmed the
+	// user does not exist, so creating it now is race-free. If the user is
+	// absent and there is no pending user, this was a re-registration whose
+	// target user has since been removed, so reject.
+	isNewUser := false
+	if user == nil {
+		if pendingUser == nil {
+			return logical.ErrorResponse(msgRegistrationFailed), nil
+		}
+		user = pendingUser
+		isNewUser = true
+	}
 
 	credential, err := w.CreateCredential(user, *session, parsed)
 	if err != nil {
@@ -197,8 +227,15 @@ func (b *backend) pathRegisterFinish(ctx context.Context, req *logical.Request, 
 	}
 
 	user.AddCredential(*credential)
+	user.RegistrationCode = ""
+	user.RegistrationCodeCreatedAt = time.Time{}
 	if err := b.saveStoredUser(ctx, req.Storage, user); err != nil {
 		return nil, err
+	}
+	if isNewUser {
+		if err := b.saveUserIDIndex(ctx, req.Storage, user.ID, username); err != nil {
+			return nil, err
+		}
 	}
 
 	return &logical.Response{

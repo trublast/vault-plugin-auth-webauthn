@@ -1,0 +1,46 @@
+report_sizes: false
+version: 2
+
+builds:
+  - id: webauthn
+    main: ./cmd/vault-plugin-auth-webauthn
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - linux
+    goarch:
+      - amd64
+      - arm64
+    mod_timestamp: "{{ .CommitTimestamp }}"
+    flags:
+      - -trimpath
+    ldflags:
+      - -s
+      - -w
+      - -extldflags -static
+      - -X {{.ModulePath}}.projectVersion=v{{.Version}}
+    binary: "webauthn-{{ .Os }}-{{ .Arch }}"
+
+archives:
+  - id: webauthn
+    formats: [binary]
+    name_template: "webauthn-{{ .Os }}-{{ .Arch }}"
+    ids:
+      - webauthn
+
+checksum:
+  name_template: 'SHA256SUMS'
+  algorithm: sha256
+
+# signs:
+#   - id: sha256
+#     artifacts: checksum
+
+sboms:
+  - artifacts: binary
+
+snapshot:
+  version_template: "{{ incpatch .Version }}-rc"
+
+release:
+  draft: true

@@ -77,7 +77,12 @@ func pathUser(b *backend) *framework.Path {
 }
 
 func (b *backend) userExistenceCheck(ctx context.Context, req *logical.Request, d *framework.FieldData) (bool, error) {
-	user, err := b.getStoredUser(ctx, req.Storage, d.Get("name").(string))
+	name := d.Get("name").(string)
+	lock := b.userLock(name)
+	lock.RLock()
+	defer lock.RUnlock()
+
+	user, err := b.getStoredUser(ctx, req.Storage, name)
 	if err != nil {
 		return false, err
 	}
@@ -91,11 +96,16 @@ func (b *backend) pathUserWrite(ctx context.Context, req *logical.Request, d *fr
 	}
 	displayName := d.Get("display_name").(string)
 
+	lock := b.userLock(name)
+	lock.Lock()
+	defer lock.Unlock()
+
 	user, err := b.getStoredUser(ctx, req.Storage, name)
 	if err != nil {
 		return nil, err
 	}
 
+	created := user == nil
 	if user == nil {
 		// Create
 		if displayName == "" {
@@ -103,6 +113,9 @@ func (b *backend) pathUserWrite(ctx context.Context, req *logical.Request, d *fr
 		}
 		user, err = NewStoredUser(name, displayName)
 		if err != nil {
+			return nil, err
+		}
+		if _, err := user.GenerateRegistrationCode(); err != nil {
 			return nil, err
 		}
 	}
@@ -124,12 +137,14 @@ func (b *backend) pathUserWrite(ctx context.Context, req *logical.Request, d *fr
 		return nil, err
 	}
 
-	return &logical.Response{
-		Data: map[string]interface{}{
-			"username":     user.Name,
-			"display_name": user.DisplayName,
-		},
-	}, nil
+	data := map[string]interface{}{
+		"username":     user.Name,
+		"display_name": user.DisplayName,
+	}
+	if created {
+		data["registration_code"] = user.RegistrationCode
+	}
+	return &logical.Response{Data: data}, nil
 }
 
 func (b *backend) pathUserList(ctx context.Context, req *logical.Request, _ *framework.FieldData) (*logical.Response, error) {
@@ -145,6 +160,10 @@ func (b *backend) pathUserRead(ctx context.Context, req *logical.Request, d *fra
 	if name == "" {
 		return logical.ErrorResponse("name is required"), nil
 	}
+	lock := b.userLock(name)
+	lock.RLock()
+	defer lock.RUnlock()
+
 	user, err := b.getStoredUser(ctx, req.Storage, name)
 	if err != nil {
 		return nil, err
@@ -173,6 +192,10 @@ func (b *backend) pathUserDelete(ctx context.Context, req *logical.Request, d *f
 	if name == "" {
 		return logical.ErrorResponse("name is required"), nil
 	}
+	lock := b.userLock(name)
+	lock.Lock()
+	defer lock.Unlock()
+
 	user, err := b.getStoredUser(ctx, req.Storage, name)
 	if err != nil {
 		return nil, err
@@ -187,6 +210,57 @@ func (b *backend) pathUserDelete(ctx context.Context, req *logical.Request, d *f
 		return nil, err
 	}
 	return nil, nil
+}
+
+func pathUserGenerateCode(b *backend) *framework.Path {
+	return &framework.Path{
+		Pattern: "user/" + framework.GenericNameRegex("name") + "/generate-code$",
+		Fields: map[string]*framework.FieldSchema{
+			"name": {
+				Type:        framework.TypeString,
+				Description: "Username",
+			},
+		},
+		Operations: map[logical.Operation]framework.OperationHandler{
+			logical.UpdateOperation: &framework.PathOperation{
+				Callback: b.pathUserGenerateCode,
+				Summary:  "Generate a new one-time registration code for a user",
+			},
+		},
+		HelpSynopsis:    "Generate a WebAuthn registration code for a user",
+		HelpDescription: "Generates and stores a new one-time code that must be supplied to register or re-register this user.",
+	}
+}
+
+func (b *backend) pathUserGenerateCode(ctx context.Context, req *logical.Request, d *framework.FieldData) (*logical.Response, error) {
+	name := d.Get("name").(string)
+	if name == "" {
+		return logical.ErrorResponse("name is required"), nil
+	}
+	lock := b.userLock(name)
+	lock.Lock()
+	defer lock.Unlock()
+
+	user, err := b.getStoredUser(ctx, req.Storage, name)
+	if err != nil {
+		return nil, err
+	}
+	if user == nil {
+		return nil, errors.New("user does not exist")
+	}
+	code, err := user.GenerateRegistrationCode()
+	if err != nil {
+		return nil, err
+	}
+	if err := b.saveStoredUser(ctx, req.Storage, user); err != nil {
+		return nil, err
+	}
+	return &logical.Response{
+		Data: map[string]interface{}{
+			"username":          user.Name,
+			"registration_code": code,
+		},
+	}, nil
 }
 
 func pathUserPolicies(b *backend) *framework.Path {
@@ -218,6 +292,10 @@ func (b *backend) pathUserPoliciesUpdate(ctx context.Context, req *logical.Reque
 	if name == "" {
 		return logical.ErrorResponse("name is required"), nil
 	}
+	lock := b.userLock(name)
+	lock.Lock()
+	defer lock.Unlock()
+
 	user, err := b.getStoredUser(ctx, req.Storage, name)
 	if err != nil {
 		return nil, err
@@ -266,6 +344,10 @@ func (b *backend) pathUserCredentialDelete(ctx context.Context, req *logical.Req
 	if err != nil {
 		return logical.ErrorResponse("invalid credential_id: must be base64url encoded"), nil
 	}
+
+	lock := b.userLock(name)
+	lock.Lock()
+	defer lock.Unlock()
 
 	user, err := b.getStoredUser(ctx, req.Storage, name)
 	if err != nil {

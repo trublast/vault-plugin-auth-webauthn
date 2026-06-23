@@ -3,6 +3,9 @@ package webauthnbackend
 import (
 	"bytes"
 	"crypto/rand"
+	"crypto/subtle"
+	"encoding/base64"
+	"time"
 
 	"github.com/go-webauthn/webauthn/protocol"
 	"github.com/go-webauthn/webauthn/webauthn"
@@ -10,6 +13,10 @@ import (
 )
 
 const userPrefix = "user/"
+const registrationCodeBytes = 32
+
+// registrationCodeTTL is how long a one-time registration code remains valid.
+const registrationCodeTTL = 7 * 24 * time.Hour
 
 // StoredUser implements webauthn.User and is persisted in Vault storage.
 type StoredUser struct {
@@ -19,6 +26,9 @@ type StoredUser struct {
 	Name        string                `json:"name"`
 	DisplayName string                `json:"display_name"`
 	Credentials []webauthn.Credential `json:"credentials"`
+
+	RegistrationCode          string    `json:"registration_code,omitempty"`
+	RegistrationCodeCreatedAt time.Time `json:"registration_code_created_at,omitempty"`
 }
 
 // NewStoredUser creates a new user with a random ID.
@@ -36,11 +46,42 @@ func NewStoredUser(name, displayName string) (*StoredUser, error) {
 }
 
 func randomID() ([]byte, error) {
-	buf := make([]byte, 8)
+	buf := make([]byte, 64)
 	if _, err := rand.Read(buf); err != nil {
 		return nil, err
 	}
 	return buf, nil
+}
+
+func generateRegistrationCode() (string, error) {
+	buf := make([]byte, registrationCodeBytes)
+	if _, err := rand.Read(buf); err != nil {
+		return "", err
+	}
+	return base64.RawURLEncoding.EncodeToString(buf), nil
+}
+
+// GenerateRegistrationCode creates a new one-time code required for registration.
+func (u *StoredUser) GenerateRegistrationCode() (string, error) {
+	code, err := generateRegistrationCode()
+	if err != nil {
+		return "", err
+	}
+	u.RegistrationCode = code
+	u.RegistrationCodeCreatedAt = time.Now().UTC()
+	return code, nil
+}
+
+// RegistrationCodeMatches returns true when code matches the current one-time code
+// and the code has not expired.
+func (u *StoredUser) RegistrationCodeMatches(code string, now time.Time) bool {
+	if u == nil || u.RegistrationCode == "" || code == "" {
+		return false
+	}
+	if u.RegistrationCodeCreatedAt.IsZero() || now.Sub(u.RegistrationCodeCreatedAt) > registrationCodeTTL {
+		return false
+	}
+	return subtle.ConstantTimeCompare([]byte(u.RegistrationCode), []byte(code)) == 1
 }
 
 // WebAuthnID returns the user's ID.

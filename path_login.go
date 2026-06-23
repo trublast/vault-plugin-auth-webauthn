@@ -3,6 +3,7 @@ package webauthnbackend
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -43,10 +44,6 @@ func pathLoginFinish(b *backend) *framework.Path {
 	return &framework.Path{
 		Pattern: "login/finish$",
 		Fields: map[string]*framework.FieldSchema{
-			"username": {
-				Type:        framework.TypeString,
-				Description: "Username (omit if using discoverable flow; user is identified from assertion userHandle)",
-			},
 			"credential": {
 				Type:        framework.TypeMap,
 				Description: "Assertion response from the authenticator (PublicKeyCredential with response)",
@@ -122,6 +119,10 @@ func (b *backend) pathLoginBegin(ctx context.Context, req *logical.Request, d *f
 	if err := validateUsername(username); err != nil {
 		return logical.ErrorResponse("invalid username: %v", err), nil
 	}
+	lock := b.userLock(username)
+	lock.RLock()
+	defer lock.RUnlock()
+
 	user, err := b.getStoredUser(ctx, req.Storage, username)
 	if err != nil {
 		return nil, err
@@ -160,10 +161,6 @@ func (b *backend) pathLoginFinish(ctx context.Context, req *logical.Request, d *
 		return logical.ErrorResponse("WebAuthn not configured"), nil
 	}
 
-	var username string
-	if v, ok := d.GetOk("username"); ok && v != nil {
-		username = strings.TrimSpace(v.(string))
-	}
 	credMap, ok := d.GetOk("credential")
 	if !ok {
 		return logical.ErrorResponse("credential is required"), nil
@@ -180,7 +177,40 @@ func (b *backend) pathLoginFinish(ctx context.Context, req *logical.Request, d *
 	}
 
 	challenge := parsed.Response.CollectedClientData.Challenge
-	loginUsername, session, err := b.getLoginSession(ctx, req.Storage, challenge)
+
+	// Peek the session (keyed by the random challenge) to discover which user
+	// we must lock. For the discoverable flow the session has no username, so
+	// resolve it from the assertion's userHandle. This read only selects the
+	// per-user lock; the authoritative read happens under the lock below.
+	loginUsername, peekSession, err := b.getLoginSession(ctx, req.Storage, challenge)
+	if err != nil {
+		return nil, err
+	}
+	if peekSession == nil {
+		return logical.ErrorResponse(msgLoginFailed), nil
+	}
+
+	lockKey := loginUsername
+	if lockKey == "" {
+		un, err := b.getUsernameByUserHandle(ctx, req.Storage, parsed.Response.UserHandle)
+		if err != nil {
+			return nil, err
+		}
+		if un == "" {
+			return logical.ErrorResponse(msgLoginFailed), nil
+		}
+		lockKey = un
+	}
+
+	lock := b.userLock(lockKey)
+	lock.Lock()
+	defer lock.Unlock()
+
+	// Authoritative read under the user lock. The challenge->username mapping is
+	// immutable, so loginUsername from the peek above stays valid; we only re-read
+	// the session here and delete it under the same lock so a concurrent finish
+	// for the same challenge sees it as already consumed (single-use).
+	_, session, err := b.getLoginSession(ctx, req.Storage, challenge)
 	if err != nil {
 		return nil, err
 	}
@@ -214,32 +244,15 @@ func (b *backend) pathLoginFinish(ctx context.Context, req *logical.Request, d *
 			return logical.ErrorResponse(msgLoginFailed), nil
 		}
 		user = discoveredUser.(*StoredUser)
-		username = user.Name
-		// Update stored credential sign count
-		for i := range user.Credentials {
-			if bytes.Equal(user.Credentials[i].ID, credential.ID) {
-				user.Credentials[i].Authenticator.SignCount = credential.Authenticator.SignCount
-				break
-			}
-		}
-		if err := b.saveStoredUser(ctx, req.Storage, user); err != nil {
-			b.Logger().Warn("failed to update credential sign count", "error", err)
+		if resp := b.finalizeCredential(ctx, req.Storage, user, credential); resp != nil {
+			return resp, nil
 		}
 		return b.loginSuccessResponse(ctx, req, user, credential)
 	}
 
-	// Username-based flow
-	if username == "" {
-		username = loginUsername
-	}
-	if loginUsername != username {
-		return logical.ErrorResponse(msgLoginFailed), nil
-	}
-	if err := validateUsername(username); err != nil {
-		return logical.ErrorResponse("invalid username: %v", err), nil
-	}
-
-	user, err = b.getStoredUser(ctx, req.Storage, username)
+	// Username-based flow: user is identified by the session (keyed by challenge).
+	// loginUsername was already validated in pathLoginBegin before being stored.
+	user, err = b.getStoredUser(ctx, req.Storage, loginUsername)
 	if err != nil {
 		return nil, err
 	}
@@ -252,18 +265,41 @@ func (b *backend) pathLoginFinish(ctx context.Context, req *logical.Request, d *
 		return logical.ErrorResponse(msgLoginFailed), nil
 	}
 
-	// Update stored credential sign count
-	for i := range user.Credentials {
-		if bytes.Equal(user.Credentials[i].ID, credential.ID) {
-			user.Credentials[i].Authenticator.SignCount = credential.Authenticator.SignCount
-			break
-		}
-	}
-	if err := b.saveStoredUser(ctx, req.Storage, user); err != nil {
-		b.Logger().Warn("failed to update credential sign count", "error", err)
+	if resp := b.finalizeCredential(ctx, req.Storage, user, credential); resp != nil {
+		return resp, nil
 	}
 
 	return b.loginSuccessResponse(ctx, req, user, credential)
+}
+
+// finalizeCredential performs the post-validation bookkeeping shared by both
+// login flows. The WebAuthn library flags Authenticator.CloneWarning when the
+// assertion's signature counter did not advance past the stored value (and both
+// are not zero), which signals a possibly cloned authenticator or a replay. In
+// that case it also leaves SignCount unchanged. For an auth backend we treat
+// this as a hard failure rather than silently accepting the login. Otherwise we
+// persist the advanced sign count so the next regression can be detected.
+//
+// A non-nil response means the login must be rejected with that response.
+func (b *backend) finalizeCredential(ctx context.Context, s logical.Storage, user *StoredUser, credential *webauthn.Credential) *logical.Response {
+	if credential.Authenticator.CloneWarning {
+		b.Logger().Warn("rejecting login: possible cloned authenticator (sign counter did not advance)",
+			"username", user.Name,
+			"credential_id", base64.RawURLEncoding.EncodeToString(credential.ID),
+		)
+		return logical.ErrorResponse(msgLoginFailed)
+	}
+	// Should we update the sign count? Potetial problem with perfomance replication.
+	// for i := range user.Credentials {
+	// 	if bytes.Equal(user.Credentials[i].ID, credential.ID) {
+	// 		user.Credentials[i].Authenticator.SignCount = credential.Authenticator.SignCount
+	// 		break
+	// 	}
+	// }
+	// if err := b.saveStoredUser(ctx, s, user); err != nil {
+	// 	b.Logger().Warn("failed to update credential sign count", "error", err)
+	// }
+	return nil
 }
 
 func (b *backend) loginSuccessResponse(ctx context.Context, req *logical.Request, user *StoredUser, credential *webauthn.Credential) (*logical.Response, error) {
@@ -317,6 +353,10 @@ func (b *backend) pathAuthRenew(ctx context.Context, req *logical.Request, _ *fr
 	if err := validateUsername(username); err != nil {
 		return nil, logical.ErrInvalidRequest
 	}
+
+	lock := b.userLock(username)
+	lock.RLock()
+	defer lock.RUnlock()
 
 	user, err := b.getStoredUser(ctx, req.Storage, username)
 	if err != nil {

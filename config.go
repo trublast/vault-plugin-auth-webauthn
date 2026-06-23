@@ -7,13 +7,13 @@ type webauthnConfig struct {
 	RPID             string   `json:"rp_id"`
 	RPDisplayName    string   `json:"rp_display_name"`
 	RPOrigins        []string `json:"rp_origins"`
-	AutoRegistration *bool   `json:"auto_registration,omitempty"`
+	AutoRegistration *bool    `json:"auto_registration,omitempty"`
 }
 
-// autoRegistrationEnabled returns true if auto-registration is enabled (default).
+// autoRegistrationEnabled returns true if auto-registration is enabled.
 func (c *webauthnConfig) autoRegistrationEnabled() bool {
 	if c == nil || c.AutoRegistration == nil {
-		return true
+		return false
 	}
 	return *c.AutoRegistration
 }

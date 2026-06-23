@@ -49,7 +49,7 @@ vault write auth/webauthn/config \
 
 - `rp_id` — идентификатор Relying Party (обычно хост без порта; для localhost допустимо `localhost`).
 - `rp_origins` — список разрешённых origin'ов (URL без пути), с которых вызывается WebAuthn (должны совпадать с тем, откуда открывается UI Vault).
-- `auto_registration` — если `true` (по умолчанию), новые пользователи могут регистрироваться самостоятельно. Если `false`, регистрироваться могут только пользователи, предсозданные администратором через `user/:name` (POST). Повторная регистрация с уже занятым именем (когда у пользователя есть credentials) запрещена.
+- `auto_registration` — если `true` (по умолчанию), новые пользователи могут регистрироваться самостоятельно. Если `false`, регистрироваться могут только пользователи, предсозданные администратором через `user/:name` (POST), с одноразовым кодом регистрации.
 
 ## Веб-приложение (демо)
 
@@ -79,12 +79,20 @@ vault write auth/webauthn/config \
 vault write auth/webauthn/user/alice display_name="Alice"
 ```
 
-После этого пользователь `alice` может пройти регистрацию. Повторная регистрация с именем, у которого уже есть credentials, запрещена.
+В ответе будет `registration_code`. После этого пользователь `alice` может начать регистрацию, передав этот код в `register/begin`. Код одноразовый, действителен 7 дней и очищается после успешной регистрации.
+
+Чтобы выпустить новый код для повторной регистрации или добавления другого ключа:
+
+```bash
+vault write auth/webauthn/user/alice/generate-code
+```
 
 1. Начать регистрацию (получить options для браузера):
 
 ```bash
-vault write auth/webauthn/register/begin username=alice
+vault write auth/webauthn/register/begin \
+  username=alice \
+  registration_code="<registration_code>"
 ```
 
 В ответе — объект `PublicKeyCredentialCreationOptions` (в т.ч. `challenge`, `rp`, `user`). Клиент (браузер или скрипт) должен вызвать `navigator.credentials.create()` с этими options и отправить результат на шаг 2.
@@ -93,7 +101,6 @@ vault write auth/webauthn/register/begin username=alice
 
 ```bash
 vault write auth/webauthn/register/finish \
-  username=alice \
   credential="$(cat credential.json)"
 ```
 
@@ -145,7 +152,8 @@ vault write auth/webauthn/login/finish credential="$(cat assertion.json)"
 
 Доступ к этим endpoint'ам требует валидного Vault-токена (в т.ч. выданного через WebAuthn).
 
-- **Создание/обновление пользователя**: `vault write auth/webauthn/user/<name>` — создаёт или обновляет пользователя. Параметры: `display_name`, `token_policies`, `token_ttl`, `token_max_ttl`, `token_bound_cidrs`, `token_no_default_policy`, `token_period`. Нужно при `auto_registration=false`; при `auto_registration=true` пользователи создаются автоматически при регистрации.
+- **Создание/обновление пользователя**: `vault write auth/webauthn/user/<name>` — создаёт или обновляет пользователя. При создании возвращает `registration_code`, который нужно передать в `register/begin` в течение 7 дней. Параметры: `display_name`, `token_policies`, `token_ttl`, `token_max_ttl`, `token_bound_cidrs`, `token_no_default_policy`, `token_period`. Нужно при `auto_registration=false`; при `auto_registration=true` пользователи создаются автоматически при регистрации.
+- **Генерация кода регистрации**: `vault write auth/webauthn/user/<name>/generate-code` — выпускает новый одноразовый `registration_code` (срок действия 7 дней) для регистрации или привязки нового WebAuthn-ключа.
 - **Политики пользователя**: `vault write auth/webauthn/user/<name>/policies token_policies="policy1,policy2"` — обновить политики токена.
 - **Список пользователей**: `vault list auth/webauthn/user/`
 - **Просмотр пользователя**: `vault read auth/webauthn/user/<name>` — возвращает `username`, `display_name`, число учётных записей (`credentials`), `user_id_b64`, а также параметры токена (`token_policies`, `token_ttl` и т.д.)
@@ -162,10 +170,11 @@ vault write auth/webauthn/login/finish credential="$(cat assertion.json)"
 | `user/:name` | POST | Создать или обновить пользователя. Body: `display_name`, `token_policies`, `token_ttl`, `token_max_ttl`, `token_bound_cidrs` и др. |
 | `user/:name` | GET | Просмотр пользователя (метаданные, число credentials, параметры токена) |
 | `user/:name` | DELETE | Удалить пользователя и все его credentials |
+| `user/:name/generate-code` | POST | Выпустить новый одноразовый код регистрации |
 | `user/:name/policies` | POST | Обновить политики токена пользователя |
 | `user/:name/credential/:id` | DELETE | Удалить один credential (id — base64url) |
-| `register/begin` | POST | Начать регистрацию (body: `username`) |
-| `register/finish` | POST | Завершить регистрацию (body: `username`, `credential`) |
+| `register/begin` | POST | Начать регистрацию (body: `username`, `registration_code` для предсозданного пользователя) |
+| `register/finish` | POST | Завершить регистрацию (body: `credential`; пользователь берется из registration session по challenge) |
 | `login/begin` | POST | Начать вход. С `username` — options для этого пользователя; без `username` — discoverable (выбор пассключа в браузере) |
 | `login/finish` | POST | Завершить вход (body: `credential`, опционально `username`). Без `username` — пользователь определяется по userHandle (discoverable) |
 

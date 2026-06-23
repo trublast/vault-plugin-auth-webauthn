@@ -5,27 +5,47 @@ import (
 	"fmt"
 	"strings"
 	"sync"
-	"time"
 
 	"github.com/go-webauthn/webauthn/protocol"
 	"github.com/go-webauthn/webauthn/webauthn"
+	lru "github.com/hashicorp/golang-lru/v2/expirable"
 	"github.com/hashicorp/vault/sdk/framework"
+	"github.com/hashicorp/vault/sdk/helper/locksutil"
 	"github.com/hashicorp/vault/sdk/logical"
 )
 
 const (
-	sessionRegistrationPrefix = "session/registration/"
-	sessionLoginPrefix        = "session/login/"
-	userIDIndexPrefix         = "user_id/"
+	userIDIndexPrefix = "user_id/"
 )
+
+// Linker-provided project/build information.
+var projectVersion string
 
 // backend implements logical.Backend for WebAuthn authentication.
 type backend struct {
 	*framework.Backend
 
+	// mu guards the cached config and the derived WebAuthn instance only.
 	mu           sync.RWMutex
 	cachedConfig *webauthnConfig
 	webAuthn     *webauthn.WebAuthn
+
+	// userLocks provides per-user serialization so that concurrent
+	// read-modify-write operations on the same StoredUser object cannot
+	// corrupt it (e.g. losing a credential), while operations on different
+	// users run in parallel.
+	userLocks []*locksutil.LockEntry
+
+	// loginSessions and registrationSessions hold in-progress (begin/finish)
+	// WebAuthn ceremonies in memory instead of Vault storage. See sessions.go
+	// for the rationale (performance-replication friendliness).
+	loginSessions        *lru.LRU[string, loginSessionEntry]
+	registrationSessions *lru.LRU[string, registrationSessionEntry]
+}
+
+// userLock returns the lock guarding the StoredUser identified by name.
+func (b *backend) userLock(name string) *locksutil.LockEntry {
+	return locksutil.LockForKey(b.userLocks, name)
 }
 
 // Factory returns a new logical.Backend.
@@ -38,7 +58,11 @@ func Factory(ctx context.Context, c *logical.BackendConfig) (logical.Backend, er
 }
 
 func newBackend() *backend {
-	b := &backend{}
+	b := &backend{
+		userLocks:            locksutil.CreateLocks(),
+		loginSessions:        newSessionCache[loginSessionEntry](),
+		registrationSessions: newSessionCache[registrationSessionEntry](),
+	}
 	b.Backend = &framework.Backend{
 		BackendType: logical.TypeCredential,
 		AuthRenew:   b.pathAuthRenew,
@@ -56,6 +80,7 @@ func newBackend() *backend {
 				pathConfig(b),
 				pathUserList(b),
 				pathUser(b),
+				pathUserGenerateCode(b),
 				pathUserPolicies(b),
 				pathUserCredential(b),
 				pathRegisterBegin(b),
@@ -64,7 +89,8 @@ func newBackend() *backend {
 				pathLoginFinish(b),
 			},
 		),
-		Help: strings.TrimSpace(backendHelp),
+		Help:           strings.TrimSpace(backendHelp),
+		RunningVersion: projectVersion,
 	}
 	return b
 }
@@ -131,11 +157,18 @@ func (b *backend) getWebAuthn(ctx context.Context, s logical.Storage) (*webauthn
 			UserVerification: protocol.VerificationPreferred,
 		},
 		Timeouts: webauthn.TimeoutsConfig{
+			// Enforce makes the library stamp SessionData.Expires and reject
+			// expired sessions server-side at finish (not just rely on the
+			// browser). It also gives the tidy a real expiry to act on.
 			Login: webauthn.TimeoutConfig{
-				Timeout: 5 * time.Minute,
+				Enforce:    true,
+				Timeout:    sessionTTL,
+				TimeoutUVD: sessionTTL,
 			},
 			Registration: webauthn.TimeoutConfig{
-				Timeout: 5 * time.Minute,
+				Enforce:    true,
+				Timeout:    sessionTTL,
+				TimeoutUVD: sessionTTL,
 			},
 		},
 	}

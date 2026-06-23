@@ -28,7 +28,8 @@ func pathConfig(b *backend) *framework.Path {
 			},
 			"auto_registration": {
 				Type:        framework.TypeBool,
-				Description: "If true (default), new users can self-register. If false, only pre-created users (via user/ path) can register.",
+				Description: "If true, new users can self-register. If false (default), only pre-created users can register.",
+				Default:     false,
 			},
 		},
 		Operations: map[logical.Operation]framework.OperationHandler{
@@ -55,9 +56,9 @@ func (b *backend) pathConfigRead(ctx context.Context, req *logical.Request, _ *f
 		return nil, nil
 	}
 	data := map[string]interface{}{
-		"rp_id":           cfg.RPID,
-		"rp_display_name": cfg.RPDisplayName,
-		"rp_origins":      cfg.RPOrigins,
+		"rp_id":             cfg.RPID,
+		"rp_display_name":   cfg.RPDisplayName,
+		"rp_origins":        cfg.RPOrigins,
 		"auto_registration": cfg.autoRegistrationEnabled(),
 	}
 	return &logical.Response{Data: data}, nil

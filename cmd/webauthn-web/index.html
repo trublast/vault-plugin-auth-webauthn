@@ -33,6 +33,11 @@
   </div>
 
   <div class="row">
+    <label for="registrationCode">Код регистрации</label>
+    <input type="text" id="registrationCode" placeholder="требуется для предсозданного пользователя" autocomplete="one-time-code">
+  </div>
+
+  <div class="row">
     <button type="button" id="btnRegister" class="primary">Регистрация</button>
     <button type="button" id="btnLogin">Вход</button>
   </div>
@@ -51,6 +56,7 @@
     (function () {
       const base = '/vault/v1/auth/webauthn';
       const usernameEl = document.getElementById('username');
+      const registrationCodeEl = document.getElementById('registrationCode');
       const btnRegister = document.getElementById('btnRegister');
       const btnLogin = document.getElementById('btnLogin');
       const messageEl = document.getElementById('message');
@@ -109,15 +115,19 @@
       }
 
       function credentialToCreationPayload(credential) {
-        return {
+        const payload = {
           id: credential.id,
           rawId: bufferEncode(credential.rawId),
           type: credential.type,
+          clientExtensionResults: credential.getClientExtensionResults(),
+          authenticatorAttachment: credential.authenticatorAttachment,
           response: {
             clientDataJSON: bufferEncode(credential.response.clientDataJSON),
             attestationObject: bufferEncode(credential.response.attestationObject),
           },
         };
+        if (!payload.authenticatorAttachment) delete payload.authenticatorAttachment;
+        return payload;
       }
 
       function credentialToAssertionPayload(credential) {
@@ -137,6 +147,7 @@
 
       btnRegister.addEventListener('click', async function () {
         const username = usernameEl.value.trim();
+        const registrationCode = registrationCodeEl.value.trim();
         if (!username) {
           showMessage('Введите имя пользователя для регистрации.', true);
           return;
@@ -144,10 +155,12 @@
         btnRegister.disabled = true;
         showMessage('Регистрация…');
         try {
+          const beginBody = { username: username };
+          if (registrationCode) beginBody.registration_code = registrationCode;
           const res = await fetch(base + '/register/begin', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ username: username }),
+            body: JSON.stringify(beginBody),
           });
           const wrap = await res.json();
           if (wrap.errors) {
@@ -164,7 +177,9 @@
           const finishRes = await fetch(base + '/register/finish', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ username: username, credential: credentialToCreationPayload(credential) }),
+            body: JSON.stringify({
+              credential: credentialToCreationPayload(credential),
+            }),
           });
           const finishWrap = await finishRes.json();
           if (finishWrap.errors) {
