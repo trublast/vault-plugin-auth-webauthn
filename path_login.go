@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/http"
 	"strings"
 
 	"github.com/go-webauthn/webauthn/protocol"
@@ -20,6 +21,11 @@ import (
 func pathLoginBegin(b *backend) *framework.Path {
 	return &framework.Path{
 		Pattern: "login/begin$",
+		DisplayAttrs: &framework.DisplayAttributes{
+			OperationPrefix: operationPrefixWebAuthn,
+			OperationVerb:   "begin",
+			OperationSuffix: "login",
+		},
 		Fields: map[string]*framework.FieldSchema{
 			"username": {
 				Type:        framework.TypeString,
@@ -30,6 +36,22 @@ func pathLoginBegin(b *backend) *framework.Path {
 			logical.UpdateOperation: &framework.PathOperation{
 				Callback: b.pathLoginBegin,
 				Summary:  "Start WebAuthn login",
+				Responses: map[int][]framework.Response{
+					http.StatusOK: {{
+						Description: http.StatusText(http.StatusOK),
+						Fields: map[string]*framework.FieldSchema{
+							"publicKey": {
+								Type:        framework.TypeMap,
+								Required:    true,
+								Description: "PublicKeyCredentialRequestOptions for navigator.credentials.get()",
+							},
+							"mediation": {
+								Type:        framework.TypeString,
+								Description: "Optional credential mediation requirement",
+							},
+						},
+					}},
+				},
 			},
 			logical.AliasLookaheadOperation: &framework.PathOperation{
 				Callback: b.pathLoginAliasLookahead,
@@ -43,6 +65,11 @@ func pathLoginBegin(b *backend) *framework.Path {
 func pathLoginFinish(b *backend) *framework.Path {
 	return &framework.Path{
 		Pattern: "login/finish$",
+		DisplayAttrs: &framework.DisplayAttributes{
+			OperationPrefix: operationPrefixWebAuthn,
+			OperationVerb:   "finish",
+			OperationSuffix: "login",
+		},
 		Fields: map[string]*framework.FieldSchema{
 			"credential": {
 				Type:        framework.TypeMap,
@@ -53,6 +80,11 @@ func pathLoginFinish(b *backend) *framework.Path {
 			logical.UpdateOperation: &framework.PathOperation{
 				Callback: b.pathLoginFinish,
 				Summary:  "Finish WebAuthn login",
+				Responses: map[int][]framework.Response{
+					http.StatusOK: {{
+						Description: http.StatusText(http.StatusOK),
+					}},
+				},
 			},
 		},
 		HelpSynopsis:    "Complete WebAuthn login",

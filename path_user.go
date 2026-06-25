@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/base64"
 	"errors"
+	"net/http"
 
 	"github.com/hashicorp/vault/sdk/framework"
 	"github.com/hashicorp/vault/sdk/helper/policyutil"
@@ -15,9 +16,11 @@ func pathUserList(b *backend) *framework.Path {
 	return &framework.Path{
 		Pattern: "user/?$",
 		DisplayAttrs: &framework.DisplayAttributes{
-			Navigation: true,
-			ItemType:   "User",
-			Action:     "List",
+			OperationPrefix: operationPrefixWebAuthn,
+			OperationSuffix: "users",
+			Navigation:      true,
+			ItemType:        "User",
+			Action:          "List",
 		},
 		Operations: map[logical.Operation]framework.OperationHandler{
 			logical.ListOperation: &framework.PathOperation{
@@ -34,8 +37,10 @@ func pathUser(b *backend) *framework.Path {
 	p := &framework.Path{
 		Pattern: "user/" + framework.GenericNameRegex("name"),
 		DisplayAttrs: &framework.DisplayAttributes{
-			ItemType: "User",
-			Action:   "Create",
+			OperationPrefix: operationPrefixWebAuthn,
+			OperationSuffix: "user",
+			Action:          "Create",
+			ItemType:        "User",
 		},
 		Fields: map[string]*framework.FieldSchema{
 			"name": {
@@ -51,18 +56,37 @@ func pathUser(b *backend) *framework.Path {
 			logical.CreateOperation: &framework.PathOperation{
 				Callback: b.pathUserWrite,
 				Summary:  "Create a user (pre-create for registration when auto_registration is false)",
+				Responses: map[int][]framework.Response{
+					http.StatusOK: {{
+						Description: http.StatusText(http.StatusOK),
+						Fields:      userWriteResponseFields(),
+					}},
+				},
 			},
 			logical.UpdateOperation: &framework.PathOperation{
 				Callback: b.pathUserWrite,
 				Summary:  "Update a user",
+				Responses: map[int][]framework.Response{
+					http.StatusOK: {{
+						Description: http.StatusText(http.StatusOK),
+						Fields:      userWriteResponseFields(),
+					}},
+				},
 			},
 			logical.ReadOperation: &framework.PathOperation{
 				Callback: b.pathUserRead,
 				Summary:  "Read a registered user",
+				Responses: map[int][]framework.Response{
+					http.StatusOK: {{
+						Description: http.StatusText(http.StatusOK),
+						Fields:      userReadResponseFields(),
+					}},
+				},
 			},
 			logical.DeleteOperation: &framework.PathOperation{
-				Callback: b.pathUserDelete,
-				Summary:  "Delete a registered user",
+				Callback:  b.pathUserDelete,
+				Summary:   "Delete a registered user",
+				Responses: responseNoContent,
 			},
 		},
 		ExistenceCheck:  b.userExistenceCheck,
@@ -74,6 +98,59 @@ func pathUser(b *backend) *framework.Path {
 		"token_no_default_policy", "token_period",
 	})
 	return p
+}
+
+// userReadResponseFields describes the response of a user read operation.
+func userReadResponseFields() map[string]*framework.FieldSchema {
+	fields := map[string]*framework.FieldSchema{
+		"username": {
+			Type:        framework.TypeString,
+			Required:    true,
+			Description: "Username",
+		},
+		"display_name": {
+			Type:        framework.TypeString,
+			Required:    true,
+			Description: "Display name for the user",
+		},
+		"credentials": {
+			Type:        framework.TypeInt,
+			Required:    true,
+			Description: "Number of registered WebAuthn credentials",
+		},
+		"credential_ids": {
+			Type:        framework.TypeStringSlice,
+			Required:    true,
+			Description: "Base64url-encoded credential IDs",
+		},
+		"user_id_b64": {
+			Type:        framework.TypeString,
+			Required:    true,
+			Description: "Base64url-encoded WebAuthn user ID",
+		},
+	}
+	tokenutil.AddTokenFields(fields)
+	return fields
+}
+
+// userWriteResponseFields describes the response of a user create/update operation.
+func userWriteResponseFields() map[string]*framework.FieldSchema {
+	return map[string]*framework.FieldSchema{
+		"username": {
+			Type:        framework.TypeString,
+			Required:    true,
+			Description: "Username",
+		},
+		"display_name": {
+			Type:        framework.TypeString,
+			Required:    true,
+			Description: "Display name for the user",
+		},
+		"registration_code": {
+			Type:        framework.TypeString,
+			Description: "One-time registration code (returned only on create)",
+		},
+	}
 }
 
 func (b *backend) userExistenceCheck(ctx context.Context, req *logical.Request, d *framework.FieldData) (bool, error) {
@@ -215,6 +292,11 @@ func (b *backend) pathUserDelete(ctx context.Context, req *logical.Request, d *f
 func pathUserGenerateCode(b *backend) *framework.Path {
 	return &framework.Path{
 		Pattern: "user/" + framework.GenericNameRegex("name") + "/generate-code$",
+		DisplayAttrs: &framework.DisplayAttributes{
+			OperationPrefix: operationPrefixWebAuthn,
+			OperationVerb:   "generate",
+			OperationSuffix: "registration-code",
+		},
 		Fields: map[string]*framework.FieldSchema{
 			"name": {
 				Type:        framework.TypeString,
@@ -225,6 +307,23 @@ func pathUserGenerateCode(b *backend) *framework.Path {
 			logical.UpdateOperation: &framework.PathOperation{
 				Callback: b.pathUserGenerateCode,
 				Summary:  "Generate a new one-time registration code for a user",
+				Responses: map[int][]framework.Response{
+					http.StatusOK: {{
+						Description: http.StatusText(http.StatusOK),
+						Fields: map[string]*framework.FieldSchema{
+							"username": {
+								Type:        framework.TypeString,
+								Required:    true,
+								Description: "Username",
+							},
+							"registration_code": {
+								Type:        framework.TypeString,
+								Required:    true,
+								Description: "One-time registration code",
+							},
+						},
+					}},
+				},
 			},
 		},
 		HelpSynopsis:    "Generate a WebAuthn registration code for a user",
@@ -266,6 +365,11 @@ func (b *backend) pathUserGenerateCode(ctx context.Context, req *logical.Request
 func pathUserPolicies(b *backend) *framework.Path {
 	return &framework.Path{
 		Pattern: "user/" + framework.GenericNameRegex("name") + "/policies$",
+		DisplayAttrs: &framework.DisplayAttributes{
+			OperationPrefix: operationPrefixWebAuthn,
+			OperationVerb:   "update",
+			OperationSuffix: "policies",
+		},
 		Fields: map[string]*framework.FieldSchema{
 			"name": {
 				Type:        framework.TypeString,
@@ -278,8 +382,9 @@ func pathUserPolicies(b *backend) *framework.Path {
 		},
 		Operations: map[logical.Operation]framework.OperationHandler{
 			logical.UpdateOperation: &framework.PathOperation{
-				Callback: b.pathUserPoliciesUpdate,
-				Summary:  "Update user token policies",
+				Callback:  b.pathUserPoliciesUpdate,
+				Summary:   "Update user token policies",
+				Responses: responseNoContent,
 			},
 		},
 		HelpSynopsis:    "Update token policies for a user",
@@ -310,6 +415,11 @@ func (b *backend) pathUserPoliciesUpdate(ctx context.Context, req *logical.Reque
 func pathUserCredential(b *backend) *framework.Path {
 	return &framework.Path{
 		Pattern: "user/" + framework.GenericNameRegex("name") + "/credential/" + framework.GenericNameRegex("credential_id"),
+		DisplayAttrs: &framework.DisplayAttributes{
+			OperationPrefix: operationPrefixWebAuthn,
+			OperationVerb:   "delete",
+			OperationSuffix: "credential",
+		},
 		Fields: map[string]*framework.FieldSchema{
 			"name": {
 				Type:        framework.TypeString,
@@ -322,8 +432,9 @@ func pathUserCredential(b *backend) *framework.Path {
 		},
 		Operations: map[logical.Operation]framework.OperationHandler{
 			logical.DeleteOperation: &framework.PathOperation{
-				Callback: b.pathUserCredentialDelete,
-				Summary:  "Remove a credential from a user",
+				Callback:  b.pathUserCredentialDelete,
+				Summary:   "Remove a credential from a user",
+				Responses: responseNoContent,
 			},
 		},
 		HelpSynopsis:    "Remove a WebAuthn credential from a user",

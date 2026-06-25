@@ -2,6 +2,7 @@ package webauthnbackend
 
 import (
 	"context"
+	"net/http"
 
 	"github.com/hashicorp/vault/sdk/framework"
 	"github.com/hashicorp/vault/sdk/logical"
@@ -11,7 +12,9 @@ func pathConfig(b *backend) *framework.Path {
 	return &framework.Path{
 		Pattern: "config$",
 		DisplayAttrs: &framework.DisplayAttributes{
-			Action: "Configure",
+			OperationPrefix: operationPrefixWebAuthn,
+			OperationSuffix: "configuration",
+			Action:          "Configure",
 		},
 		Fields: map[string]*framework.FieldSchema{
 			"rp_id": {
@@ -36,10 +39,38 @@ func pathConfig(b *backend) *framework.Path {
 			logical.ReadOperation: &framework.PathOperation{
 				Callback: b.pathConfigRead,
 				Summary:  "Read WebAuthn configuration",
+				Responses: map[int][]framework.Response{
+					http.StatusOK: {{
+						Description: http.StatusText(http.StatusOK),
+						Fields: map[string]*framework.FieldSchema{
+							"rp_id": {
+								Type:        framework.TypeString,
+								Required:    true,
+								Description: "Relying Party ID.",
+							},
+							"rp_display_name": {
+								Type:        framework.TypeString,
+								Required:    true,
+								Description: "Human-readable name for the Relying Party.",
+							},
+							"rp_origins": {
+								Type:        framework.TypeCommaStringSlice,
+								Required:    true,
+								Description: "Allowed origins for WebAuthn.",
+							},
+							"auto_registration": {
+								Type:        framework.TypeBool,
+								Required:    true,
+								Description: "Whether new users can self-register.",
+							},
+						},
+					}},
+				},
 			},
 			logical.UpdateOperation: &framework.PathOperation{
-				Callback: b.pathConfigWrite,
-				Summary:  "Configure WebAuthn backend",
+				Callback:  b.pathConfigWrite,
+				Summary:   "Configure WebAuthn backend",
+				Responses: responseNoContent,
 			},
 		},
 		HelpSynopsis:    "Configure the WebAuthn authentication backend",

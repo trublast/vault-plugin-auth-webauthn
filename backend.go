@@ -3,6 +3,7 @@ package webauthnbackend
 import (
 	"context"
 	"fmt"
+	"net/http"
 	"strings"
 	"sync"
 
@@ -16,7 +17,18 @@ import (
 
 const (
 	userIDIndexPrefix = "user_id/"
+
+	// operationPrefixWebAuthn is used to generate stable OpenAPI operation IDs.
+	operationPrefixWebAuthn = "webauthn"
 )
+
+// responseNoContent documents an empty (204) response for write/delete
+// operations that return no body.
+var responseNoContent = map[int][]framework.Response{
+	http.StatusNoContent: {{
+		Description: "No Content",
+	}},
+}
 
 // Linker-provided project/build information.
 var projectVersion string

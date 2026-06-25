@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"net/http"
 	"strings"
 	"time"
 
@@ -16,6 +17,11 @@ import (
 func pathRegisterBegin(b *backend) *framework.Path {
 	return &framework.Path{
 		Pattern: "register/begin$",
+		DisplayAttrs: &framework.DisplayAttributes{
+			OperationPrefix: operationPrefixWebAuthn,
+			OperationVerb:   "begin",
+			OperationSuffix: "registration",
+		},
 		Fields: map[string]*framework.FieldSchema{
 			"username": {
 				Type:        framework.TypeString,
@@ -30,6 +36,22 @@ func pathRegisterBegin(b *backend) *framework.Path {
 			logical.UpdateOperation: &framework.PathOperation{
 				Callback: b.pathRegisterBegin,
 				Summary:  "Start WebAuthn registration",
+				Responses: map[int][]framework.Response{
+					http.StatusOK: {{
+						Description: http.StatusText(http.StatusOK),
+						Fields: map[string]*framework.FieldSchema{
+							"publicKey": {
+								Type:        framework.TypeMap,
+								Required:    true,
+								Description: "PublicKeyCredentialCreationOptions for navigator.credentials.create()",
+							},
+							"mediation": {
+								Type:        framework.TypeString,
+								Description: "Optional credential mediation requirement",
+							},
+						},
+					}},
+				},
 			},
 		},
 		HelpSynopsis:    "Begin WebAuthn registration for a user",
@@ -40,6 +62,11 @@ func pathRegisterBegin(b *backend) *framework.Path {
 func pathRegisterFinish(b *backend) *framework.Path {
 	return &framework.Path{
 		Pattern: "register/finish$",
+		DisplayAttrs: &framework.DisplayAttributes{
+			OperationPrefix: operationPrefixWebAuthn,
+			OperationVerb:   "finish",
+			OperationSuffix: "registration",
+		},
 		Fields: map[string]*framework.FieldSchema{
 			"credential": {
 				Type:        framework.TypeMap,
@@ -50,6 +77,23 @@ func pathRegisterFinish(b *backend) *framework.Path {
 			logical.UpdateOperation: &framework.PathOperation{
 				Callback: b.pathRegisterFinish,
 				Summary:  "Finish WebAuthn registration",
+				Responses: map[int][]framework.Response{
+					http.StatusOK: {{
+						Description: http.StatusText(http.StatusOK),
+						Fields: map[string]*framework.FieldSchema{
+							"username": {
+								Type:        framework.TypeString,
+								Required:    true,
+								Description: "Registered username",
+							},
+							"message": {
+								Type:        framework.TypeString,
+								Required:    true,
+								Description: "Registration status message",
+							},
+						},
+					}},
+				},
 			},
 		},
 		HelpSynopsis:    "Complete WebAuthn registration",
